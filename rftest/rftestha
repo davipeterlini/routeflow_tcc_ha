@@ -1,0 +1,178 @@
+#!/bin/bash
+
+if [ "$EUID" != "0" ]; then
+  echo "You must be root to run this script."
+  exit 1
+fi
+
+#PROTOCOLS="OpenFlow10,OpenFlow12,OpenFlow13"
+SCRIPT_NAME="rftest1"
+LXCDIR=/var/lib/lxc
+MONGODB_CONF=/etc/mongodb.conf
+MONGODB_PORT=27017
+MONGODB_ADDR="192.168.10.1"
+CONTROLLER_PORT1=6633
+CONTROLLER_PORT2=6634
+RF_HOME=..
+RF_HOME1=`cd ..;pwd`
+export PATH=$PATH:/usr/local/bin:/usr/local/sbin
+export PYTHONPATH=$PYTHONPATH:$RF_HOME
+
+cd $RF_HOME
+
+wait_port_listen() {
+    port=$1
+    while ! `nc -z localhost $port` ; do
+        echo -n .
+        sleep 1
+    done
+}
+
+echo_bold() {
+    echo -e "\033[1m${1}\033[0m"
+}
+
+kill_process_tree() {
+    top=$1
+    pid=$2
+
+    children=`ps -o pid --no-headers --ppid ${pid}`
+
+    for child in $children
+    do
+        kill_process_tree 0 $child
+    done
+
+    if [ $top -eq 0 ]; then
+        kill -9 $pid &> /dev/null
+    fi
+}
+
+reset() {
+    init=$1;
+    if [ $init -eq 1 ]; then
+        echo_bold "-> Starting $SCRIPT_NAME";
+    else
+        echo_bold "-> Stopping child processes...";
+        kill_process_tree 1 $$
+    fi
+
+    sudo ovs-vsctl del-br dp0 &> /dev/null;
+    sudo ovs-vsctl del-br switch1 &> /dev/null;
+    sudo ovs-vsctl emer-reset &> /dev/null;
+
+    echo_bold "-> Stopping and resetting LXC VMs...";
+    for vm in rfvm1 b1 b2; do
+        lxc-shutdown -n "$vm"
+        if [ $? -ne 0 ]; then
+            lxc-stop -n $vm
+        fi
+        rm -rf $LXCDIR/$vm/rootfs/var/run/network/ifstate;
+    done
+
+    echo_bold "-> Shutting down MongoDB instance 1..."
+    mongod -f $RF_HOME1/rftest/mongo/conf/master.conf --replSet rs0 --shutdown
+
+    echo_bold "-> Shutting down MongoDB instance 2..."
+    mongod -f $RF_HOME1/rftest/mongo/conf/slave1.conf --replSet rs0 --shutdown
+
+    echo_bold "-> Shutting down MongoDB instance 3..."
+    mongod -f $RF_HOME1/rftest/mongo/conf/slave2.conf --replSet rs0 --shutdown
+
+    echo_bold "-> Deleting data from previous runs...";
+    rm -rf $RF_HOME1/rftest/mongo/data/*/*
+    rm -rf /var/lib/lxc/rfvm1/rootfs/opt/rfclient;
+}
+reset 1
+trap "reset 0; exit 0" INT
+
+if [ "$ACTION" != "RESET" ]; then
+    echo_bold "-> Setting up the management bridge (lxcbr0)..."
+    ifconfig lxcbr0 $MONGODB_ADDR up
+#    ovs-vsctl add-port lxcbr0 rfvm1.0
+
+    echo_bold "-> Setting up MongoDB instance 1..."
+    mongod -f $RF_HOME1/rftest/mongo/conf/master.conf --replSet rs0
+
+    echo_bold "-> Setting up MongoDB instance 2..."
+    mongod -f $RF_HOME1/rftest/mongo/conf/slave1.conf --replSet rs0
+
+    echo_bold "-> Setting up MongoDB instance 3..."
+    mongod -f $RF_HOME1/rftest/mongo/conf/slave2.conf --replSet rs0
+
+    echo_bold "-> Initializing Replica set..."
+    mongo --quiet 192.168.10.1:27017/db --eval "rs.initiate()"
+    # conferring if instance exists to master
+    while [[ `mongo --quiet 192.168.10.1:27017/db --eval "db.isMaster().ismaster"` == false ]]; do
+        echo "Waiting instance becomes primary..."
+        sleep 5       
+    done
+    # setting other instance 
+    mongo 192.168.10.1:27017/db --eval "load('$RF_HOME1/rftest/initReplicaSet.js')"
+
+    echo_bold "-> Waiting 20s for replica set intialization..."
+    sleep 20
+
+    echo_bold "-> Starting the rfvm1 virtual machine..."
+    # Create the rfclient dir
+    mkdir /var/lib/lxc/rfvm1/rootfs/opt/rfclient
+
+    # Copy the rfclient executable
+    cp build/rfclient /var/lib/lxc/rfvm1/rootfs/opt/rfclient/rfclient
+
+    # We sleep for a few seconds to wait for the interfaces to go up
+    echo "#!/bin/sh" > /var/lib/lxc/rfvm1/rootfs/root/run_rfclient.sh
+    echo "sleep 3" >> /var/lib/lxc/rfvm1/rootfs/root/run_rfclient.sh
+    echo "/opt/rfclient/rfclient -a $MONGODB_ADDR 2>&1 >/var/log/rfclient.log" >> /var/lib/lxc/rfvm1/rootfs/root/run_rfclient.sh
+
+    chmod +x /var/lib/lxc/rfvm1/rootfs/root/run_rfclient.sh
+
+	lxc-start -n rfvm1 -d
+
+	echo_bold "-> Starting RFMonitor..."
+	./rfserver/rfmonitor.py &
+
+	echo_bold "-> Starting the controller and RFPRoxy..."
+	ryu-manager ryu-rfproxy/rfproxy.py --ofp-role master --ofp-tcp-listen-port $CONTROLLER_PORT1 &
+	wait_port_listen $CONTROLLER_PORT1
+	ryu-manager ryu-rfproxy/rfproxy.py --ofp-role slave --ofp-tcp-listen-port $CONTROLLER_PORT2 &
+	wait_port_listen $CONTROLLER_PORT2
+
+	echo_bold "-> Starting RFServer..."
+	./rfserver/rfserver.py rftest/rftest1config.csv &
+
+	#echo_bold "-> Starting RFVM1..."
+	#lxc-start -n rfvm1 -d
+	#sleep 3
+
+	echo_bold "-> Starting the control plane network (dp0 VS)..."
+	ovs-vsctl add-br dp0
+	ovs-vsctl add-port dp0 rfvm1.1
+	ovs-vsctl add-port dp0 rfvm1.2
+	ovs-vsctl set Bridge dp0 other-config:datapath-id=7266767372667673 protocols=OpenFlow10,OpenFlow12,OpenFlow13
+	ovs-vsctl set-controller dp0 tcp:127.0.0.1:$CONTROLLER_PORT1 tcp:127.0.0.1:$CONTROLLER_PORT2
+	ifconfig dp0 up
+
+	echo_bold "-> Starting the sample network..."
+	# Start the host VMs and give them a little time
+	lxc-start -n b1 -d
+	lxc-start -n b2 -d
+	sleep 2
+	ovs-vsctl add-br switch1
+	ovs-vsctl add-port switch1 b1.0
+	ovs-vsctl add-port switch1 b2.0
+	ovs-vsctl set Bridge switch1 other-config:datapath-id=0000000000000099 protocols=OpenFlow10,OpenFlow12,OpenFlow13
+	ovs-vsctl set-controller switch1 tcp:127.0.0.1:$CONTROLLER_PORT1 tcp:127.0.0.1:$CONTROLLER_PORT2
+	ifconfig switch1 up
+
+	echo_bold "---"
+	echo_bold "This test is up and running."
+	echo_bold "Try pinging host b2 from host b1:"
+	echo_bold "  $ sudo lxc-console -n b1"
+	echo_bold "Login and run:"
+	echo_bold "  $ ping 172.31.2.2"
+	echo_bold "You can stop this test by pressing Ctrl+C."
+	echo_bold "---"
+	wait
+fi
+exit 0
